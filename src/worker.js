@@ -1,11 +1,8 @@
 // ============================================
-// Binance AI Trading Bot v4 - Cloudflare Worker
+// Binance AI Trading Bot v4.1 - Cloudflare Worker
 // AI: Gemini 2.0 Flash + Groq Llama 3.3 70B
-// Data: Binance Ücretsiz API (OI, L/S, Funding)
-// Pump Avcısı + Disiplinli Mod
+// Data: Binance Ücretsiz API
 // ============================================
-
-const crypto = globalThis.crypto;
 
 const BINANCE_BASE = "https://fapi.binance.com";
 const BINANCE_DATA = "https://fapi.binance.com/futures/data";
@@ -23,30 +20,42 @@ function jsonResp(data, status = 200) {
   });
 }
 
-// ── Binance İmza ──────────────────────────────
-function sign(qs, secret) {
-  return crypto.createHmac("sha256", secret).update(qs).digest("hex");
+// ── Binance İmza (Web Crypto API) ─────────────
+async function sign(qs, secret) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw", enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false, ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(qs));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 async function binanceRequest(env, method, path, params = {}) {
   const ts = Date.now();
   const allParams = { ...params, timestamp: ts };
- const qs = new URLSearchParams(Object.entries(allParams).map(([k,v]) => [k, String(v)])).toString();
-  const sig = sign(qs, env.BINANCE_SECRET);
-  const url = `${BINANCE_BASE}${path}?${qs}&signature=${sig}`;
+  const qs = new URLSearchParams(
+    Object.entries(allParams).map(([k, v]) => [k, String(v)])
+  ).toString();
+  const sig = await sign(qs, env.BINANCE_SECRET);
+  const fullQs = `${qs}&signature=${sig}`;
+  const url = `${BINANCE_BASE}${path}?${fullQs}`;
   const res = await fetch(url, {
     method,
     headers: {
       "X-MBX-APIKEY": env.BINANCE_API_KEY,
       "Content-Type": "application/x-www-form-urlencoded",
     },
-    body: method !== "GET" ? `${qs}&signature=${sig}` : undefined,
+    body: method !== "GET" ? fullQs : undefined,
   });
   if (!res.ok) throw new Error(`Binance: ${await res.text()}`);
   return res.json();
 }
 
-// ── Binance Ücretsiz Piyasa Verileri ─────────
+// ── Binance Public API ─────────────────────────
 async function getAllTickers() {
   const res = await fetch(`${BINANCE_BASE}/fapi/v1/ticker/24hr`);
   return res.json();
@@ -73,18 +82,7 @@ async function getOrderBook(symbol) {
   return res.json();
 }
 
-// Ücretsiz: Open Interest
-async function getOpenInterest(symbol) {
-  try {
-    const res = await fetch(
-      `${BINANCE_BASE}/fapi/v1/openInterest?symbol=${symbol}`
-    );
-    const data = await res.json();
-    return parseFloat(data.openInterest || 0);
-  } catch { return 0; }
-}
-
-// Ücretsiz: OI Geçmişi (trend analizi)
+// ── Binance Ücretsiz Piyasa Verileri ──────────
 async function getOIHistory(symbol) {
   try {
     const res = await fetch(
@@ -103,7 +101,6 @@ async function getOIHistory(symbol) {
   } catch { return null; }
 }
 
-// Ücretsiz: Long/Short Oranı (likidasyon yerine)
 async function getLongShortRatio(symbol) {
   try {
     const res = await fetch(
@@ -120,14 +117,13 @@ async function getLongShortRatio(symbol) {
       longPct: (parseFloat(latest.longAccount) * 100).toFixed(1),
       shortPct: (parseFloat(latest.shortAccount) * 100).toFixed(1),
       trend: lsRatio > prevRatio ? "MORE_LONGS" : "MORE_SHORTS",
-      // Aşırı long = düzeltme riski, aşırı short = squeeze potansiyeli
-      bias: lsRatio > 1.5 ? "OVERLEVERAGED_LONG" :
-            lsRatio < 0.7 ? "SHORT_SQUEEZE_POTENTIAL" : "NEUTRAL",
+      bias:
+        lsRatio > 1.5 ? "OVERLEVERAGED_LONG" :
+        lsRatio < 0.7 ? "SHORT_SQUEEZE_POTENTIAL" : "NEUTRAL",
     };
   } catch { return null; }
 }
 
-// Ücretsiz: Funding Rate
 async function getFundingRate(symbol) {
   try {
     const res = await fetch(
@@ -137,15 +133,13 @@ async function getFundingRate(symbol) {
     const rate = parseFloat(data.lastFundingRate) * 100;
     return {
       rate: rate.toFixed(4),
-      // Yüksek pozitif = longlar short'lara ödüyor = aşırı iyimserlik
-      // Negatif = shortlar longlara ödüyor = aşırı kötümserlik
-      sentiment: rate > 0.05 ? "OVERLEVERAGED_BULLS" :
-                 rate < -0.01 ? "OVERLEVERAGED_BEARS" : "NEUTRAL",
+      sentiment:
+        rate > 0.05 ? "OVERLEVERAGED_BULLS" :
+        rate < -0.01 ? "OVERLEVERAGED_BEARS" : "NEUTRAL",
     };
   } catch { return null; }
 }
 
-// Ücretsiz: Taker Buy/Sell Hacmi
 async function getTakerVolume(symbol) {
   try {
     const res = await fetch(
@@ -153,12 +147,12 @@ async function getTakerVolume(symbol) {
     );
     const data = await res.json();
     if (!Array.isArray(data) || data.length === 0) return null;
-    const buyVol = data.reduce((a, d) => a + parseFloat(d.buySellRatio), 0) / data.length;
+    const avg = data.reduce((a, d) => a + parseFloat(d.buySellRatio), 0) / data.length;
     return {
-      buySellRatio: buyVol.toFixed(3),
-      // > 1 alıcılar baskın, < 1 satıcılar baskın
-      pressure: buyVol > 1.1 ? "BUY_PRESSURE" :
-                buyVol < 0.9 ? "SELL_PRESSURE" : "BALANCED",
+      buySellRatio: avg.toFixed(3),
+      pressure:
+        avg > 1.1 ? "BUY_PRESSURE" :
+        avg < 0.9 ? "SELL_PRESSURE" : "BALANCED",
     };
   } catch { return null; }
 }
@@ -218,7 +212,7 @@ function analyzeIndicators(klines) {
   };
 }
 
-// ── Order Book Doğrulaması ─────────────────────
+// ── Order Book Doğrulaması ────────────────────
 async function validateEntry(symbol, indicatorPrice) {
   try {
     const book = await getOrderBook(symbol);
@@ -227,16 +221,11 @@ async function validateEntry(symbol, indicatorPrice) {
     const spread = ((bestAsk - bestBid) / bestBid) * 100;
     const midPrice = (bestBid + bestAsk) / 2;
     const drift = Math.abs((midPrice - indicatorPrice) / indicatorPrice) * 100;
-    return {
-      valid: spread < 0.1 && drift < 0.5,
-      spread: spread.toFixed(4),
-      drift: drift.toFixed(4),
-      midPrice,
-    };
+    return { valid: spread < 0.1 && drift < 0.5, spread: spread.toFixed(4), drift: drift.toFixed(4) };
   } catch { return { valid: true }; }
 }
 
-// ── Pump Dedektörü ─────────────────────────────
+// ── Pump Dedektörü ────────────────────────────
 async function detectPumps(tickers) {
   const pumps = [];
   for (const t of tickers) {
@@ -248,9 +237,7 @@ async function detectPumps(tickers) {
       const klines = await getKlines(t.symbol, "1m", 10);
       const closes = klines.map((k) => k.close);
       const volumes = klines.map((k) => k.volume);
-      const recentChange =
-        ((closes[closes.length - 1] - closes[closes.length - 4]) /
-          closes[closes.length - 4]) * 100;
+      const recentChange = ((closes[closes.length - 1] - closes[closes.length - 4]) / closes[closes.length - 4]) * 100;
       const avgVol = volumes.slice(0, 7).reduce((a, b) => a + b, 0) / 7;
       const recentVol = volumes.slice(-3).reduce((a, b) => a + b, 0) / 3;
       const volSpike = recentVol / avgVol;
@@ -271,35 +258,22 @@ async function detectPumps(tickers) {
   return pumps.sort((a, b) => Math.abs(b.recentChange) - Math.abs(a.recentChange)).slice(0, 5);
 }
 
-// ── Gemini AI (Pump Avcısı - Hızlı) ──────────
+// ── Gemini AI (Pump Avcısı) ───────────────────
 async function getGeminiDecision(env, symbol, indicators, marketData) {
-  const prompt = `You are a crypto futures trading expert in PUMP HUNTER mode. Analyze and respond ONLY with JSON.
+  const prompt = `You are a crypto futures expert in PUMP HUNTER mode. Respond ONLY with JSON, no markdown.
 
 SYMBOL: ${symbol}
-MODE: PUMP_HUNTER (fast in/out)
-
-TECHNICAL (1m candles):
-RSI: ${indicators.rsi} | Trend: ${indicators.trend}
-EMA20: ${indicators.ema20} | EMA50: ${indicators.ema50}
-MACD: ${indicators.macd}
-BB: ${indicators.bb_upper}/${indicators.bb_middle}/${indicators.bb_lower}
-Price: ${indicators.currentPrice} | Volume ratio: ${indicators.volumeRatio}x
-
-MARKET DATA:
-Long/Short Ratio: ${marketData.ls?.ratio || "N/A"} (${marketData.ls?.bias || "N/A"})
-Long%: ${marketData.ls?.longPct || "N/A"}% | Short%: ${marketData.ls?.shortPct || "N/A"}%
-Funding Rate: ${marketData.funding?.rate || "N/A"}% (${marketData.funding?.sentiment || "N/A"})
+RSI: ${indicators.rsi} | Trend: ${indicators.trend} | Volume: ${indicators.volumeRatio}x
+EMA20/50: ${indicators.ema20}/${indicators.ema50} | MACD: ${indicators.macd}
+Price: ${indicators.currentPrice}
+Long/Short: ${marketData.ls?.ratio || "N/A"} (${marketData.ls?.bias || "N/A"})
+Funding: ${marketData.funding?.rate || "N/A"}% (${marketData.funding?.sentiment || "N/A"})
 OI Trend: ${marketData.oi?.trend || "N/A"} (${marketData.oi?.changePct || "N/A"}%)
-Taker Pressure: ${marketData.taker?.pressure || "N/A"}
+Taker: ${marketData.taker?.pressure || "N/A"}
 
-PUMP RULES:
-- SHORT_SQUEEZE_POTENTIAL + OI RISING + BUY_PRESSURE = strong LONG
-- OVERLEVERAGED_LONG + OI FALLING + RSI>75 = SHORT (pump over)
-- OVERLEVERAGED_BULLS (high funding) + RSI>70 = SHORT risk
-- Keep TP tight (1-3%), SL tight (0.5-1.5%), max leverage 8x
+Rules: SHORT_SQUEEZE_POTENTIAL+OI_RISING+BUY_PRESSURE=LONG, OVERLEVERAGED_LONG+RSI>75+OI_FALLING=SHORT, keep TP 1-3%, SL 0.5-1.5%, max 8x leverage.
 
-Respond ONLY with this JSON (no markdown, no text):
-{"action":"LONG or SHORT or SKIP","confidence":0-100,"leverage":2-8,"take_profit_pct":0.5-3,"stop_loss_pct":0.3-1.5,"reason":"one sentence in Turkish"}`;
+{"action":"LONG or SHORT or SKIP","confidence":0-100,"leverage":2-8,"take_profit_pct":0.5-3,"stop_loss_pct":0.3-1.5,"reason":"Turkish one sentence"}`;
 
   try {
     const res = await fetch(
@@ -317,37 +291,23 @@ Respond ONLY with this JSON (no markdown, no text):
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
     return JSON.parse(text.replace(/```json|```/g, "").trim());
   } catch {
-    return { action: "SKIP", confidence: 0, reason: "Gemini parse hatası" };
+    return { action: "SKIP", confidence: 0, reason: "Gemini hatası" };
   }
 }
 
-// ── Groq AI (Disiplinli Mod - Derin Analiz) ───
+// ── Groq AI (Disiplinli Mod) ──────────────────
 async function getGroqDecision(env, symbol, indicators, marketData) {
-  const prompt = `Sen bir kripto futures uzmanısın. DİSİPLİNLİ moddasın — sadece yüksek kalite sinyallerde işlem aç.
+  const prompt = `Sen kripto futures uzmanısın. DİSİPLİNLİ mod — sadece güven 70+ işlem aç. SADECE JSON yanıt ver.
 
 SEMBOL: ${symbol}
-
-TEKNİK (3m mumlar):
-RSI: ${indicators.rsi} | Trend: ${indicators.trend}
-EMA20/50: ${indicators.ema20} / ${indicators.ema50}
-MACD: ${indicators.macd}
-BB Üst/Orta/Alt: ${indicators.bb_upper} / ${indicators.bb_middle} / ${indicators.bb_lower}
-Fiyat: ${indicators.currentPrice} | Hacim oranı: ${indicators.volumeRatio}x
-
-PİYASA VERİSİ (Binance ücretsiz):
-Long/Short Oranı: ${marketData.ls?.ratio || "N/A"} → ${marketData.ls?.bias || "N/A"}
-Long: %${marketData.ls?.longPct || "N/A"} | Short: %${marketData.ls?.shortPct || "N/A"}
-Funding Rate: %${marketData.funding?.rate || "N/A"} → ${marketData.funding?.sentiment || "N/A"}
-OI Değişimi: %${marketData.oi?.changePct || "N/A"} → ${marketData.oi?.trend || "N/A"}
-Taker Baskısı: ${marketData.taker?.pressure || "N/A"}
-
-DİSİPLİNLİ KURALLAR:
-- Güven 70+ olmadan SKIP
-- SHORT_SQUEEZE_POTENTIAL + OI artıyor + BUY_PRESSURE → güçlü LONG
-- OVERLEVERAGED_LONG + yüksek funding + RSI>70 → SHORT
-- Fiyat BB altı + RSI<35 + OI artıyor → dip LONG fırsatı
-- EMA20 > EMA50 + MACD pozitif + BUY_PRESSURE → trend LONG
-- Sadece JSON yanıt ver, markdown yok
+RSI: ${indicators.rsi} | Trend: ${indicators.trend} | Hacim: ${indicators.volumeRatio}x
+EMA20/50: ${indicators.ema20}/${indicators.ema50} | MACD: ${indicators.macd}
+BB: ${indicators.bb_upper}/${indicators.bb_middle}/${indicators.bb_lower}
+Fiyat: ${indicators.currentPrice}
+L/S Oranı: ${marketData.ls?.ratio || "N/A"} → ${marketData.ls?.bias || "N/A"}
+Funding: %${marketData.funding?.rate || "N/A"} → ${marketData.funding?.sentiment || "N/A"}
+OI: %${marketData.oi?.changePct || "N/A"} → ${marketData.oi?.trend || "N/A"}
+Taker: ${marketData.taker?.pressure || "N/A"}
 
 {"action":"LONG veya SHORT veya SKIP","confidence":0-100,"leverage":2-10,"take_profit_pct":1.5-8,"stop_loss_pct":0.8-3,"reason":"Türkçe tek cümle"}`;
 
@@ -367,10 +327,9 @@ DİSİPLİNLİ KURALLAR:
       }),
     });
     const data = await res.json();
-    const text = data.choices?.[0]?.message?.content || "";
-    return JSON.parse(text);
+    return JSON.parse(data.choices?.[0]?.message?.content || "{}");
   } catch {
-    return { action: "SKIP", confidence: 0, reason: "Groq parse hatası" };
+    return { action: "SKIP", confidence: 0, reason: "Groq hatası" };
   }
 }
 
@@ -418,12 +377,14 @@ async function placeOrder(env, symbol, side, quantity, leverage, tpPct, slPct) {
   return { entry, tp, sl };
 }
 
-// ── KV: Sinyal Geçmişi ─────────────────────────
+// ── KV Sinyal Geçmişi ──────────────────────────
 async function saveSignal(env, signal) {
   if (!env.BOT_KV) return;
-  await env.BOT_KV.put(`signal:${Date.now()}:${signal.symbol}`, JSON.stringify(signal), {
-    expirationTtl: 86400 * 7,
-  });
+  await env.BOT_KV.put(
+    `signal:${Date.now()}:${signal.symbol}`,
+    JSON.stringify(signal),
+    { expirationTtl: 86400 * 7 }
+  );
 }
 
 async function getSignalHistory(env, limit = 50) {
@@ -457,7 +418,7 @@ async function runBot(env) {
     log(`💰 Bakiye: $${balance.toFixed(2)} | 📊 ${openPositions.length}/5 pozisyon`);
     if (balance < 20) { log("⚠️ Yetersiz bakiye"); return { logs, signals }; }
 
-    // ── PUMP AVCI MODU (Gemini) ──
+    // ── PUMP AVCI (Gemini) ──
     log("\n🚀 Pump taraması (Gemini)...");
     const pumps = await detectPumps(tickers);
     log(`  ${pumps.length} pump/dump tespit edildi`);
@@ -465,7 +426,6 @@ async function runBot(env) {
     for (const pump of pumps) {
       if (openPositions.length >= 5) break;
       if (openPositions.find((p) => p.symbol === pump.symbol)) continue;
-
       log(`\n💥 ${pump.symbol} | ${pump.direction} %${pump.recentChange} | Vol: ${pump.volSpike}x`);
 
       const [klines, ls, funding, oi, taker] = await Promise.all([
@@ -478,36 +438,23 @@ async function runBot(env) {
 
       const indicators = analyzeIndicators(klines);
       const marketData = { ls, funding, oi, taker };
-
-      log(`  RSI: ${indicators.rsi} | L/S: ${ls?.ratio || "N/A"} | Funding: ${funding?.rate || "N/A"}%`);
-
       const decision = await getGeminiDecision(env, pump.symbol, indicators, marketData);
       log(`  🔵 Gemini: ${decision.action} | %${decision.confidence} | ${decision.reason}`);
 
       const signal = {
         id: `pump_${Date.now()}`,
-        mode: "PUMP_HUNTER",
-        ai: "Gemini 2.0 Flash",
-        symbol: pump.symbol,
-        action: decision.action,
-        confidence: decision.confidence,
-        reason: decision.reason,
-        price: pump.price,
-        rsi: indicators.rsi,
-        volSpike: pump.volSpike,
-        recentChange: pump.recentChange,
-        direction: pump.direction,
-        lsRatio: ls?.ratio,
-        fundingRate: funding?.rate,
-        oiTrend: oi?.trend,
-        timestamp: Date.now(),
-        executed: false,
+        mode: "PUMP_HUNTER", ai: "Gemini 2.0 Flash",
+        symbol: pump.symbol, action: decision.action,
+        confidence: decision.confidence, reason: decision.reason,
+        price: pump.price, rsi: indicators.rsi,
+        volSpike: pump.volSpike, recentChange: pump.recentChange,
+        direction: pump.direction, timestamp: Date.now(), executed: false,
       };
 
       if (decision.action !== "SKIP" && decision.confidence >= 65) {
         const validation = await validateEntry(pump.symbol, pump.price);
         if (!validation.valid) {
-          log(`  ⚠️ Fiyat doğrulaması başarısız (spread: ${validation.spread}%)`);
+          log(`  ⚠️ Spread çok geniş: ${validation.spread}%`);
           signal.skipReason = "Spread çok geniş";
         } else {
           const qty = ((balance * 0.30 * decision.leverage) / pump.price).toFixed(3);
@@ -523,27 +470,25 @@ async function runBot(env) {
       } else {
         log(`  ⏭️ Atlandı`);
       }
-
       signals.push(signal);
       await saveSignal(env, signal);
     }
 
     // ── DİSİPLİNLİ MOD (Groq) ──
     if (openPositions.length < 5) {
-      log("\n🤖 Disiplinli tarama (Groq Llama)...");
+      log("\n🤖 Disiplinli tarama (Groq)...");
       const topSymbols = tickers
         .filter((t) => t.symbol.endsWith("USDT") &&
           parseFloat(t.quoteVolume) > 30_000_000 &&
           Math.abs(parseFloat(t.priceChangePercent)) > 2)
         .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
-        .slice(0, 20)
-        .map((t) => t.symbol)
+        .slice(0, 20).map((t) => t.symbol)
         .filter((s) => !openPositions.find((p) => p.symbol === s));
 
       for (const symbol of topSymbols.slice(0, 5)) {
         if (openPositions.length >= 5) break;
-
         log(`\n📈 ${symbol}`);
+
         const [klines, ls, funding, oi, taker] = await Promise.all([
           getKlines(symbol, "3m", 100),
           getLongShortRatio(symbol),
@@ -554,28 +499,16 @@ async function runBot(env) {
 
         const indicators = analyzeIndicators(klines);
         const marketData = { ls, funding, oi, taker };
-
-        log(`  RSI: ${indicators.rsi} | L/S: ${ls?.ratio || "N/A"} | OI: ${oi?.trend || "N/A"}`);
-
         const decision = await getGroqDecision(env, symbol, indicators, marketData);
         log(`  🟢 Groq: ${decision.action} | %${decision.confidence} | ${decision.reason}`);
 
         const signal = {
           id: `disc_${Date.now()}`,
-          mode: "DISCIPLINED",
-          ai: "Groq Llama 3.3 70B",
+          mode: "DISCIPLINED", ai: "Groq Llama 3.3 70B",
           symbol, action: decision.action,
-          confidence: decision.confidence,
-          reason: decision.reason,
-          price: indicators.currentPrice,
-          rsi: indicators.rsi,
-          trend: indicators.trend,
-          lsRatio: ls?.ratio,
-          fundingRate: funding?.rate,
-          oiTrend: oi?.trend,
-          takerPressure: taker?.pressure,
-          timestamp: Date.now(),
-          executed: false,
+          confidence: decision.confidence, reason: decision.reason,
+          price: indicators.currentPrice, rsi: indicators.rsi,
+          trend: indicators.trend, timestamp: Date.now(), executed: false,
         };
 
         if (decision.action !== "SKIP" && decision.confidence >= 70) {
@@ -609,7 +542,7 @@ async function runBot(env) {
   return { logs, signals };
 }
 
-// ── Cloudflare Worker Handler ──────────────────
+// ── Worker Handler ─────────────────────────────
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runBot(env));
@@ -649,7 +582,7 @@ export default {
     }
 
     return new Response(
-      "🤖 Binance AI Bot v4\n/api/run /api/status /api/signals /api/market",
+      "🤖 Binance AI Bot v4.1\n/api/run /api/status /api/signals /api/market",
       { headers: CORS }
     );
   },
