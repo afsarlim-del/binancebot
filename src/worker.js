@@ -5,7 +5,7 @@
 // Pump Avcısı + Disiplinli Mod
 // ============================================
 
-import crypto from "node:crypto";
+const crypto = globalThis.crypto;
 
 const BINANCE_BASE = "https://fapi.binance.com";
 const BINANCE_DATA = "https://fapi.binance.com/futures/data";
@@ -31,7 +31,7 @@ function sign(qs, secret) {
 async function binanceRequest(env, method, path, params = {}) {
   const ts = Date.now();
   const allParams = { ...params, timestamp: ts };
-  const qs = new URLSearchParams(allParams).toString();
+ const qs = new URLSearchParams(Object.entries(allParams).map(([k,v]) => [k, String(v)])).toString();
   const sig = sign(qs, env.BINANCE_SECRET);
   const url = `${BINANCE_BASE}${path}?${qs}&signature=${sig}`;
   const res = await fetch(url, {
