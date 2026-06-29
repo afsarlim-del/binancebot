@@ -580,7 +580,15 @@ export default {
         }));
       return jsonResp({ topCoins: top, pumps, timestamp: Date.now() });
     }
-
+if (url.pathname === "/api/test") {
+      try {
+        const res = await fetch("https://fapi.binance.com/fapi/v1/ping");
+        const data = await res.json();
+        return jsonResp({ binance: "OK", data });
+      } catch (err) {
+        return jsonResp({ binance: "HATA", error: err.message }, 500);
+      }
+    }
     return new Response(
       "🤖 Binance AI Bot v4.1\n/api/run /api/status /api/signals /api/market",
       { headers: CORS }
